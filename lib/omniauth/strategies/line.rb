@@ -4,6 +4,8 @@ require "json"
 module OmniAuth
   module Strategies
     class Line < OmniAuth::Strategies::OAuth2
+      class NoAuthorizationCodeError < StandardError; end
+
       option :name, "line"
       option :scope, "profile openid email"
 
@@ -13,6 +15,8 @@ module OmniAuth
         token_url: "/oauth2/v2.1/token",
       }
 
+      option :authorization_code_from_signed_request_in_cookie, nil
+      
       option :access_token_options, {
         grant_type: "authorization_code",
       }
@@ -29,7 +33,11 @@ module OmniAuth
       # host changed
       def callback_phase
         options[:client_options][:site] = "https://api.line.me"
-        super
+        with_authorization_code! do
+          super
+        end
+      rescue NoAuthorizationCodeError => e
+        fail!(:no_authorization_code, e)
       end
 
       uid { raw_info["userId"] }
@@ -82,6 +90,31 @@ module OmniAuth
           target += "=" * (4 - rem)
         end
         return JSON.load(Base64.urlsafe_decode64(target))
+      end
+
+      # Picks the authorization code in order, from:
+      #
+      # 1. The request 'code' param (manual callback from standard server-side flow)
+      # 2. A signed request from cookie (passed from the client during the client-side flow)
+      def with_authorization_code!
+        if request.params.key?("code")
+          yield
+        elsif code_from_signed_request = signed_request_from_cookie && signed_request_from_cookie["code"]
+          request.params["code"] = code_from_signed_request
+          options.authorization_code_from_signed_request_in_cookie = true
+          
+          original_provider_ignores_state = options.provider_ignores_state
+          options.provider_ignores_state = true
+          begin
+            yield
+          ensure
+            request.params.delete("code")
+            options.authorization_code_from_signed_request_in_cookie = false
+            options.provider_ignores_state = original_provider_ignores_state
+          end
+        else
+          raise NoAuthorizationCodeError, "must pass either a `code`"
+        end
       end
 
       def prune!(hash)
